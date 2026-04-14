@@ -1,55 +1,66 @@
-from fastapi import WebSocket
-from openai import AsyncOpenAI
+import asyncio
 import os
 import json
-from .rag import semantic_search
+from fastapi import WebSocket, WebSocketDisconnect
+from groq import AsyncGroq
+from services.rag import semantic_search
 
-openai_api_key = os.environ.get("OPENAI_API_KEY")
+# Initialize Groq client
+async_groq_client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY", "dummy_key"))
 
-openai_client = AsyncOpenAI(api_key=openai_api_key) if openai_api_key and openai_api_key != "your_openai_api_key_here" else None
-
-
-async def handle_voice_interaction(websocket: WebSocket, supabase_client):
-    """
-    Highly optimized bi-directional Voice & RAG logic path.
-    Rejects HTTP overhead in favor of WebSockets.
-    """
+async def handle_voice_interaction(websocket: WebSocket):
     await websocket.accept()
+    print("Engine B: WebSocket Connection Established.")
+
     try:
         while True:
-            # 1. Listen for streaming text chunks from the Front-end Speech API or direct audio bits
-            text_data = await websocket.receive_text()
-            data = json.loads(text_data)
-            query = data.get("query", "")
+            # Receive text or audio events from frontend
+            message = await websocket.receive()
             
-            if not query:
+            transcript = ""
+            if "text" in message:
+                try:
+                    data = json.loads(message["text"])
+                    transcript = data.get("text", "")
+                except:
+                    transcript = message["text"]
+            
+            if not transcript:
+                # If binary audio is received, we would normally proxy to Deepgram's streaming STT socket here.
+                # For this implementation, we echo a placeholder unless mapped explicitly to STT.
                 continue
 
-            # 2. Vector DB Similarity matching
-            context = semantic_search(query, supabase_client)
+            print(f"Triggering Engine B inference for: {transcript}")
+            await websocket.send_json({"type": "status", "content": "searching"})
+
+            # 1. Engine B: Semantic Search internally via FAISS
+            context = semantic_search(transcript)
+            prompt = f"Answer concisely based on the following text:\n{context}\n\nQuestion: {transcript}"
             
-            prompt = f"Use this context to accurately answer the user's query. If the context is empty, answer broadly but succinctly.\n\nContext:\n{context}\n\nQuery: {query}"
-            
-            # 3. Blazing fast generation (OpenAI GPT)
-            answer = "OpenAI API key missing. Please configure in .env."
-            if openai_client:
-                completion = await openai_client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": "You are SonicDoc AI, a highly fast and accurate document assistant. Keep your answers conversational and helpful."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.3,
-                    max_tokens=600
+            await websocket.send_json({"type": "status", "content": "generating"})
+
+            # 2. Engine B: Fire prompt to Groq LLaMA 3
+            try:
+                chat_completion = await async_groq_client.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="llama3-8b-8192",
+                    stream=True,
                 )
-                answer = completion.choices[0].message.content
-            
-            # 4. Stream answer back. For ultra-low latency, the frontend will use the 
-            # browser's native Web Speech Synthesis API to read the text instantly rather than waiting for an audio blob over the wire.
-            await websocket.send_text(json.dumps({
-                "type": "answer",
-                "text": answer
-            }))
-            
+                
+                # 3. Engine B: Stream back output text tokens
+                # In full pipeline, tokens go instantly into Deepgram TTS WS, streaming binary back.
+                async for chunk in chat_completion:
+                    token = chunk.choices[0].delta.content or ""
+                    if token:
+                        await websocket.send_json({"type": "token", "content": token})
+                        
+                await websocket.send_json({"type": "status", "content": "done"})
+                
+            except Exception as ml_err:
+                await websocket.send_json({"type": "error", "content": str(ml_err)})
+                print(f"Groq API Error: {ml_err}")
+
+    except WebSocketDisconnect:
+        print("Engine B: Client Disconnected")
     except Exception as e:
-        print(f"WebSocket closed or encountered an error: {e}")
+        print(f"Error in websocket loop: {e}")
